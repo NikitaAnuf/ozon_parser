@@ -2,18 +2,19 @@ from argparse import ArgumentParser, Namespace
 import re
 import time
 import random
+from datetime import datetime
+from pprint import pprint
 
 # Парсер на основе Chrome
 from undetected_chromedriver import Chrome
+from fake_useragent import UserAgent
 
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions
-from selenium.common import TimeoutException
-
-from fake_useragent import UserAgent
+from selenium.common.exceptions import TimeoutException, StaleElementReferenceException
 
 
 BASE_URL = 'https://www.ozon.ru/'
@@ -23,6 +24,14 @@ MIMIC_PAUSE = 1 # sec
 DRIVER_PATIENCE = 10 # sec
 # Placeholder в поисковой строке. Вынесен в отдельную переменную для возможности быстрой замены
 SEARCH_INPUT_PLACEHOLDER = 'Искать на Ozon'
+# Название класса секции карточек товаров
+SECTION_CLASS_NAME = 'qi0_24'
+# Класс, определяющий карточки товара
+CARD_CLASS_NAME = 'tile-root'
+# Количество просматриваемых карточек
+CARD_SEARCH_PATIENCE = 100
+# Атрибут ссылки на карточку, в котором нужно искать артикул
+SKU_TAG_ATTRIBUTE = 'data-prerender'
 
 
 # Инициализация парсера аргументов командной строки
@@ -31,7 +40,7 @@ def init_arg_parser() -> ArgumentParser:
 
     # Оба аргумента позиционные. Сначала поисковой запрос, потом артикул товара
     parser.add_argument('query', help='Поисковой запрос')
-    parser.add_argument('article', help='Артикул товара')
+    parser.add_argument('sku', help='Артикул товара')
 
     return parser
 
@@ -40,7 +49,7 @@ def init_arg_parser() -> ArgumentParser:
 def check_arguments(args: Namespace) -> tuple[str | None, str | None, str | None]:
     try:
         # Если одного из аргументов нет, возвращаю ошибку
-        query, article = args.query, args.article
+        query, sku = args.query, args.sku
     except Exception as ex:
         return None, None, f'Ошибка в извлечении значений аргументов скрипта - {ex.args}'
 
@@ -49,13 +58,12 @@ def check_arguments(args: Namespace) -> tuple[str | None, str | None, str | None
     if len(query.strip()) == 0:
         return None, None, 'Поисковый запрос составлен неверно, в нём должен быть хотя бы один непробельный символ'
 
-    # Проверка аргумента article на правильность. Артикул состоит из 10 чисел
-    # Решил использовать регулярное выражение, чтобы не делать сложные условия
-    if not re.match(r'^[0-9]{10}$', article):
-        return None, None, 'Введённый артикул неверный, он должен состоять из 10 числовых символов'
+    # Проверка аргумента sku на правильность
+    if not re.match(r'^[0-9]+$', sku):
+        return None, None, 'Введённый артикул неверный, он должен состоять только из числовых символов'
 
-    # Если всё правильно, возвращаем query и article без ошибок
-    return query, article, None
+    # Если всё правильно, возвращаем query и sku без ошибок
+    return query, sku, None
 
 
 def init_web_driver() -> Chrome:
@@ -77,6 +85,7 @@ def init_web_driver() -> Chrome:
     return driver
 
 
+# Поиск товаров по тексту запроса
 def input_search_query(driver: Chrome, query: str) -> str | None:
     try:
         # Ждём пока появится строка поиска
@@ -103,8 +112,92 @@ def input_search_query(driver: Chrome, query: str) -> str | None:
     return None
 
 
+def crawl_through_page(driver: Chrome, target_sku: str) -> tuple[bool | None, int | None, int | None, str | None]:
+    def get_all_cards() -> list:
+        cards = driver.find_elements(By.XPATH, f'.//*[contains(@class, "{CARD_CLASS_NAME}")]')
+        if cards:
+            return cards
+        return []
+
+    def extract_sku_from_card(card) -> str | None:
+        try:
+            link_elem = card.find_element(By.XPATH, ".//a[contains(@href, '/product/')]")
+            href = link_elem.get_attribute("href")
+            if href:
+                match = re.search(r'/product/[^/]*?(\d{5,50})[/?]', href)
+                if match:
+                    return match.group(1)
+        except:
+            pass
+        return None
+
+    scroll_count = 0
+    position = 1
+    last_card_count = 0
+    no_new_cards_counter = 0
+
+    while position <= CARD_SEARCH_PATIENCE:
+        cards = get_all_cards()
+        if not cards:
+            try:
+                # Ждём появления хотя бы одной карточки
+                WebDriverWait(driver, DRIVER_PATIENCE).until(
+                    expected_conditions.presence_of_element_located((By.XPATH, f'.//*[contains(@class, {CARD_CLASS_NAME})]'))
+                )
+                cards = get_all_cards()
+            except TimeoutException:
+                return False, None, None, "Не найдены карточки товаров"
+            if not cards:
+                return False, None, None, "Не найдены карточки товаров"
+
+        if len(cards) > last_card_count:
+            for i in range(last_card_count, len(cards)):
+                try:
+                    sku = extract_sku_from_card(cards[i])
+                except StaleElementReferenceException:
+                    continue
+                if sku and sku == target_sku:
+                    return True, position, scroll_count, None
+                position += 1
+                if position > CARD_SEARCH_PATIENCE:
+                    break
+            last_card_count = len(cards)
+            no_new_cards_counter = 0
+        else:
+            no_new_cards_counter += 1
+            if no_new_cards_counter >= 2:
+                break
+
+        if position > CARD_SEARCH_PATIENCE:
+            break
+
+        # Прокрутка вниз
+        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+        scroll_count += 1
+        try:
+            WebDriverWait(driver, DRIVER_PATIENCE).until(
+                lambda d: len(get_all_cards()) > last_card_count
+            )
+        except TimeoutException:
+            pass
+        time.sleep(MIMIC_PAUSE)
+
+    return False, None, None, None
+
+
+def compile_result(query: str, sku: str, position: int, page: int) -> dict:
+    return {
+        'query': query,
+        'sku': sku,
+        'position': position,
+        'page': page,
+        'total_checked': position, # Алгоритм останавливается сразу после нахождения нужного товара
+        'timestamp': datetime.now().isoformat(timespec='seconds')
+    }
+
+
 # Общая функция для поиска товара
-def find_product(query: str, article: str) -> tuple[dict | str | None, str | None]:
+def find_product(query: str, sku: str) -> tuple[dict | str | None, str | None]:
     driver = None
     try:
         try:
@@ -118,14 +211,23 @@ def find_product(query: str, article: str) -> tuple[dict | str | None, str | Non
         time.sleep(MIMIC_PAUSE)
 
         error = input_search_query(driver, query)
+        time.sleep(MIMIC_PAUSE)
         if error is not None:
             return None, error
+
+        is_found, position, page, error = crawl_through_page(driver, sku)
     finally:
         time.sleep(MIMIC_PAUSE)
         if driver:
             driver.quit()
 
-        return {}, None
+    if error is not None:
+        return None, error
+    elif not is_found:
+        return 'not_found', None
+    else:
+        return compile_result(query, sku, position, page), None
+
 
 
 if __name__ == '__main__':
@@ -138,11 +240,13 @@ if __name__ == '__main__':
         print(f'Ошибка в получении аргументов скрипта: {ex.__str__()}')
         exit()
 
-    query, article, error = check_arguments(args)
+    query, sku, error = check_arguments(args)
     if error is not None:
         print(error)
         exit()
 
-    result, error = find_product(query, article)
+    result, error = find_product(query, sku)
     if error is not None:
         print(error)
+    else:
+        pprint(result, sort_dicts=False)
