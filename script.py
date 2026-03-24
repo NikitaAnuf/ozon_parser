@@ -32,6 +32,8 @@ CARD_CLASS_NAME = 'tile-root'
 CARD_SEARCH_PATIENCE = 100
 # Атрибут ссылки на карточку, в котором нужно искать артикул
 SKU_TAG_ATTRIBUTE = 'data-prerender'
+# Время ожидания подгрузки страницы
+SCROLL_LOAD_PATIENCE = 5 # sec
 
 
 # Инициализация парсера аргументов командной строки
@@ -114,7 +116,7 @@ def input_search_query(driver: Chrome, query: str) -> str | None:
 
 def crawl_through_page(driver: Chrome, target_sku: str) -> tuple[bool | None, int | None, int | None, str | None]:
     def get_all_cards() -> list:
-        cards = driver.find_elements(By.XPATH, f'.//*[contains(@class, "{CARD_CLASS_NAME}")]')
+        cards = driver.find_elements(By.CLASS_NAME, f'{CARD_CLASS_NAME}')
         if cards:
             return cards
         return []
@@ -132,11 +134,11 @@ def crawl_through_page(driver: Chrome, target_sku: str) -> tuple[bool | None, in
         return None
 
     scroll_count = 0
-    position = 1
-    last_card_count = 0
     no_new_cards_counter = 0
+    unique_skus = []
+    last_unique_skus_len = -1
 
-    while position <= CARD_SEARCH_PATIENCE:
+    while len(unique_skus) <= CARD_SEARCH_PATIENCE:
         cards = get_all_cards()
         if not cards:
             try:
@@ -150,36 +152,42 @@ def crawl_through_page(driver: Chrome, target_sku: str) -> tuple[bool | None, in
             if not cards:
                 return False, None, None, "Не найдены карточки товаров"
 
-        if len(cards) > last_card_count:
-            for i in range(last_card_count, len(cards)):
+        if last_unique_skus_len < len(unique_skus):
+            last_unique_skus_len = len(unique_skus)
+            for i in range(len(cards)):
                 try:
                     sku = extract_sku_from_card(cards[i])
+                    if sku in unique_skus:
+                        continue
+                    else:
+                        unique_skus.append(sku)
                 except StaleElementReferenceException:
                     continue
                 if sku and sku == target_sku:
-                    return True, position, scroll_count, None
-                position += 1
-                if position > CARD_SEARCH_PATIENCE:
+                    return True, len(unique_skus), scroll_count + 1, None
+                if len(unique_skus) > CARD_SEARCH_PATIENCE:
                     break
-            last_card_count = len(cards)
             no_new_cards_counter = 0
         else:
             no_new_cards_counter += 1
-            if no_new_cards_counter >= 2:
+            if no_new_cards_counter >= 5:
                 break
 
-        if position > CARD_SEARCH_PATIENCE:
+        if len(unique_skus) > CARD_SEARCH_PATIENCE:
             break
 
-        # Прокрутка вниз
-        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+        # Скролл до последней известной карточки
+        driver.execute_script("arguments[0].scrollIntoView();", cards[-1])
         scroll_count += 1
+        time.sleep(MIMIC_PAUSE)
+
         try:
-            WebDriverWait(driver, DRIVER_PATIENCE).until(
-                lambda d: len(get_all_cards()) > last_card_count
+            WebDriverWait(driver, SCROLL_LOAD_PATIENCE).until(
+                lambda d: len(get_all_cards()) >= 48
             )
         except TimeoutException:
             pass
+
         time.sleep(MIMIC_PAUSE)
 
     return False, None, None, None
@@ -191,7 +199,7 @@ def compile_result(query: str, sku: str, position: int, page: int) -> dict:
         'sku': sku,
         'position': position,
         'page': page,
-        'total_checked': position, # Алгоритм останавливается сразу после нахождения нужного товара
+        'total_checked': CARD_SEARCH_PATIENCE,
         'timestamp': datetime.now().isoformat(timespec='seconds')
     }
 
